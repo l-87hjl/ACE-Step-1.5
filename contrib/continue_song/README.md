@@ -42,8 +42,24 @@ as context, default 60; 0 = everything), `--lookahead`, `--fade-ms`, `--model`
 (`acestep-v15-turbo` default; `acestep-v15-base`/`-sft` use 50 steps, CFG, DCW off),
 `--repaint-mode`, `--reference-self`, `--seed`, `--candidates`, `--mlx-dit`.
 
-Outputs: every candidate of every pass, `continued.wav`, and `manifest.json` (splice
-times, chosen candidates, overlap distances). The default `--out-dir` is
+Added for the first real-song test:
+
+- `--lyrics-plan plan.json`: per-pass `segment` and `lyrics`. Each pass's sheet covers
+  its context window plus the new material, so sections advance instead of every pass
+  seeing the whole song.
+- `--first-overlap`: a separate overlap for the first join.
+- `--grid-bpm` + `--beat-offset`: snap cuts to the beat grid. The grid BPM is not sent
+  to the model.
+- `--words-json` + `--word-margin`: word timings of the source (for example from
+  Whisper). The first cut avoids sung words.
+- `--gain-match-db`: gain-match the new audio to the existing audio over the overlap
+  (clipped to +/- N dB).
+- `--max-passes`: stop early, for first-join studies.
+
+Outputs: every candidate of every pass (float WAV), `continued_48k.wav`,
+`continued_native.wav`, and `manifest.json` (splice and fade times, gains, levels at each
+join, chosen candidates). If the input is not 48 kHz, `continued_native.wav` is written at
+the input's own rate and is bit-identical to the input up to the first crossfade. The default `--out-dir` is
 `acestep_output/continue_song/`, which upstream's `.gitignore` already excludes. Keep
 source songs outside the repository or in an ignored path; upstream ignores `*.wav`,
 `*.mp3`, `data/`, `checkpoints/` but **not** `*.flac`, `*.m4a`, `*.ogg` or `*.aiff`.
@@ -56,14 +72,15 @@ of the DiT are both resident.
 ## Tests
 
 ```bash
-python -m unittest contrib/continue_song/splice_test.py
+python -m unittest contrib/continue_song/splice_test.py contrib/continue_song/plan_test.py
 ```
 
 ## Known limitations
 
 - Candidate choice uses an objective proxy (spectral distance in the overlap); it is not
   a musical judgement. Listen to the candidates.
-- Lyrics are passed whole for every pass; per-section lyric planning is not handled.
-  In a 4-pass test the lyrics advanced in order, but the bridge and chorus came back
-  in the last pass.
+- Without `--lyrics-plan`, lyrics are passed whole for every pass. In a 4-pass test the
+  lyrics advanced in order, but the bridge and chorus came back in the last pass.
+- Phrase protection applies to the first join only; later joins are between generated
+  passes, for which no word timings exist.
 - The original is bit-exact only up to the start of the fade at the chosen splice.

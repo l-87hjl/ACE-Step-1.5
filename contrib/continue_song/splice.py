@@ -128,3 +128,20 @@ def equal_power_splice(original: np.ndarray, generated: np.ndarray, cut: int,
         out[f0:f1] = (np.cos(t * np.pi / 2) * original[f0:f1]
                       + np.sin(t * np.pi / 2) * generated[f0:f1])
     return out
+
+
+def overlap_distance(a: np.ndarray, b: np.ndarray) -> float:
+    """Mean log-band distance between two equal-timeline excerpts (lower = closer)."""
+    n = min(len(a), len(b))
+    fa = frame_log_energy_bands(a[:n].mean(1), 960)
+    fb = frame_log_energy_bands(b[:n].mean(1), 960)
+    return float(np.linalg.norm(fa - fb, axis=1).mean())
+
+
+def join_record(full: np.ndarray, cut_abs: int, fade: int, sr: int) -> dict:
+    """Level just before and after the join of an assembled candidate."""
+    def rms_db(x):
+        return round(float(20 * np.log10(np.sqrt(np.mean(np.square(x))) + 1e-12)), 2)
+    return {"rms_db_2s_before": rms_db(full[max(0, cut_abs - fade // 2 - 2 * sr):
+                                            max(1, cut_abs - fade // 2)]),
+            "rms_db_2s_after": rms_db(full[cut_abs + fade // 2:cut_abs + fade // 2 + 2 * sr])}

@@ -10,7 +10,6 @@ Example:
         --caption "indie pop, female vocals" --lyrics-file lyrics.txt --candidates 3
 """
 
-import argparse
 import json
 import os
 import sys
@@ -21,52 +20,11 @@ import soundfile as sf
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from runtime import SR, load_48k_stereo, release_cached_memory  # noqa: E402
+from cli_args import build_parser  # noqa: E402
+from plan import beat_grid, load_lyrics_plan, match_gain, unsung_times  # noqa: E402
+from runtime import write_native_master  # noqa: E402
 from splice import (choose_splice_sample, effective_end_s, equal_power_splice,  # noqa: E402
-                    frame_log_energy_bands)
-
-
-def overlap_distance(a: np.ndarray, b: np.ndarray) -> float:
-    """Mean log-band distance between two equal-timeline excerpts (lower = closer)."""
-    n = min(len(a), len(b))
-    fa = frame_log_energy_bands(a[:n].mean(1), 960)
-    fb = frame_log_energy_bands(b[:n].mean(1), 960)
-    return float(np.linalg.norm(fa - fb, axis=1).mean())
-
-
-def build_parser() -> argparse.ArgumentParser:
-    """Command-line interface."""
-    p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    p.add_argument("input")
-    p.add_argument("--target-duration", type=float, required=True)
-    p.add_argument("--segment", type=float, default=60.0, help="new seconds per pass")
-    p.add_argument("--overlap", type=float, default=6.0, help="seconds regenerated before the end")
-    p.add_argument("--context", type=float, default=60.0, help="max seconds fed as context (0=all)")
-    p.add_argument("--fade-ms", type=float, default=250.0)
-    p.add_argument("--lookahead", type=float, default=10.0,
-                   help="extra seconds generated then discarded on intermediate passes")
-    p.add_argument("--no-trim-fade", dest="trim_fade", action="store_false",
-                   help="splice at the literal end even if the clip fades out")
-    p.add_argument("--caption", default="")
-    p.add_argument("--lyrics", default=None)
-    p.add_argument("--lyrics-file", default=None)
-    p.add_argument("--instrumental", action="store_true")
-    p.add_argument("--bpm", type=int, default=None)
-    p.add_argument("--key", default="")
-    p.add_argument("--timesig", default="")
-    p.add_argument("--language", default="unknown")
-    p.add_argument("--seed", type=int, default=1234)
-    p.add_argument("--candidates", type=int, default=1)
-    p.add_argument("--model", default="acestep-v15-turbo")
-    p.add_argument("--steps", type=int, default=None)
-    p.add_argument("--repaint-mode", default="balanced")
-    p.add_argument("--repaint-strength", type=float, default=0.5)
-    p.add_argument("--reference-self", action="store_true",
-                   help="also pass input as reference_audio")
-    p.add_argument("--mlx-dit", action="store_true", help="use MLX DiT (more memory)")
-    p.add_argument("--mlx-cache-gb", type=float, default=2.0, help="cap on MLX buffer cache")
-    p.add_argument("--out-dir", default="acestep_output/continue_song",
-                   help="default lies under the upstream-ignored acestep_output/")
-    return p
+                    join_record, overlap_distance)
 
 
 def init_handler(model: str, use_mlx_dit: bool):
@@ -109,50 +67,81 @@ def generate_window(h, a, ctx_path: str, rs: float, re_: float, seed: int, lyric
     return audio
 
 
-def run_pass(h, a, cur: np.ndarray, n_pass: int, lyrics: str, tmp: str) -> dict:
+def splice_candidates(a, n_pass: int, rs: float, d: float, ctx0: float, words):
+    """Allowed cut times (window coordinates) for this join, or ``None`` = any frame."""
+    bpm = a.grid_bpm or a.bpm
+    if bpm is None or a.beat_offset is None:
+        return None
+    beats = beat_grid(bpm, a.beat_offset, rs + ctx0, d)
+    if n_pass == 1:
+        free = unsung_times(beats, words, a.word_margin)
+        beats = free if len(free) else beats
+    return beats - ctx0
+
+
+def run_pass(h, a, cur: np.ndarray, n_pass: int, plan: dict, words, tmp: str) -> dict:
     """Generate candidates for one extension pass and return the pass record.
 
     The splice window is ``[end - overlap, end]`` where ``end`` ignores a trailing
-    fade (see ``effective_end_s``). Intermediate passes generate ``lookahead`` extra
-    seconds and discard them, so an outro the model writes at the window end is not kept.
+    fade. Intermediate passes generate ``lookahead`` extra seconds and discard them, so
+    an outro the model writes at the window end is not kept. New audio is gain-matched
+    to the existing audio over the overlap before the equal-power splice.
     """
     d = effective_end_s(cur, SR) if a.trim_fade else len(cur) / SR
     ctx0 = 0.0 if a.context <= 0 else max(0.0, d - a.context)
     i0 = int(ctx0 * SR)
     ctx_path = os.path.join(tmp, f"ctx{n_pass}.wav")
     sf.write(ctx_path, cur[i0:], SR, subtype="FLOAT")
-    keep_end = min(a.target_duration, d + a.segment)
+    keep_end = min(a.target_duration, d + plan["segment"])
     gen_end = keep_end if keep_end >= a.target_duration else keep_end + a.lookahead
-    rs, re_ = max(0.0, d - a.overlap) - ctx0, gen_end - ctx0
+    overlap = a.first_overlap if (n_pass == 1 and a.first_overlap is not None) else a.overlap
+    rs, re_ = max(0.0, d - overlap) - ctx0, gen_end - ctx0
     ref = a.input if a.reference_self else None
     orig = cur[i0:]
+    w0, w1 = int(rs * SR), int((d - ctx0) * SR)
+    allowed = splice_candidates(a, n_pass, rs, d, ctx0, words)
+    fade = int(a.fade_ms * SR / 1000)
     cands = []
     for k in range(a.candidates):
         seed = a.seed + 1000 * n_pass + k
-        gen = generate_window(h, a, ctx_path, rs, re_, seed, lyrics, ref, tmp)
+        gen = generate_window(h, a, ctx_path, rs, re_, seed, plan["lyrics"], ref, tmp)
         gen = gen[: int((keep_end - ctx0) * SR)]
-        cut = choose_splice_sample(orig, gen, SR, rs, d - ctx0)
-        fade = int(a.fade_ms * SR / 1000)
+        g = match_gain(orig[w0:w1], gen[w0:w1], a.gain_match_db)
+        gen = gen * g
+        cut = choose_splice_sample(orig, gen, SR, rs, d - ctx0, beat_times_s=allowed)
         full = np.concatenate([cur[:i0], equal_power_splice(orig, gen, cut, fade)])
-        w0, w1 = int(rs * SR), int((d - ctx0) * SR)
         dist = overlap_distance(orig[w0:w1], gen[w0:w1]) if w1 > w0 else 0.0
         path = os.path.join(a.out_dir, f"pass{n_pass}_cand{k}_seed{seed}.wav")
-        sf.write(path, full, SR, subtype="PCM_24")
-        cands.append({"seed": seed, "path": path, "cut_s": (i0 + cut) / SR,
-                      "overlap_dist": dist, "audio": full})
+        sf.write(path, full, SR, subtype="FLOAT")
+        cands.append({"seed": seed, "path": path, "cut_s": round((i0 + cut) / SR, 4),
+                      "fade_s": [round((i0 + cut - fade // 2) / SR, 4),
+                                 round((i0 + cut + fade // 2) / SR, 4)],
+                      "gain_db": round(float(20 * np.log10(g)), 2), "overlap_dist": dist,
+                      **join_record(full, i0 + cut, fade, SR), "audio": full})
     best = min(cands, key=lambda c: c["overlap_dist"])
-    return {"pass": n_pass, "context_start_s": ctx0, "src_effective_end_s": d,
+    return {"pass": n_pass, "label": plan.get("label", ""), "context_start_s": ctx0,
+            "src_effective_end_s": d, "overlap_s": overlap,
             "repaint_window_s": [rs + ctx0, gen_end], "kept_end_s": keep_end,
+            "phrase_protected_cut": bool(n_pass == 1 and words and allowed is not None),
             "chosen": best["path"], "audio": best["audio"],
             "candidates": [{k: v for k, v in c.items() if k != "audio"} for c in cands]}
+
+
+def pass_plans(a) -> list:
+    """Per-pass segment/lyrics: from --lyrics-plan, else one repeating default pass."""
+    if a.lyrics_plan:
+        return load_lyrics_plan(a.lyrics_plan)
+    lyrics = a.lyrics or (open(a.lyrics_file).read() if a.lyrics_file else "")
+    if a.instrumental and not lyrics:
+        lyrics = "[Instrumental]"
+    return [{"segment": a.segment, "lyrics": lyrics}]
 
 
 def main() -> None:
     """Extend the input pass by pass and write candidates, the result and a manifest."""
     a = build_parser().parse_args()
-    lyrics = a.lyrics or (open(a.lyrics_file).read() if a.lyrics_file else "")
-    if a.instrumental and not lyrics:
-        lyrics = "[Instrumental]"
+    plans = pass_plans(a)
+    words = json.load(open(a.words_json))["words"] if a.words_json else None
     os.makedirs(a.out_dir, exist_ok=True)
     cur = load_48k_stereo(a.input)
     h = init_handler(a.model, a.mlx_dit)
@@ -160,13 +149,21 @@ def main() -> None:
     manifest = {"input": a.input, "args": vars(a), "passes": []}
     tmp = tempfile.mkdtemp(prefix="continue_song_")
     while len(cur) / SR < a.target_duration - 0.5:
-        rec = run_pass(h, a, cur, len(manifest["passes"]) + 1, lyrics, tmp)
+        n = len(manifest["passes"]) + 1
+        if a.max_passes and n > a.max_passes:
+            break
+        rec = run_pass(h, a, cur, n, plans[min(n, len(plans)) - 1], words, tmp)
         cur = rec.pop("audio")
         manifest["passes"].append(rec)
         print(json.dumps({k: rec[k] for k in ("pass", "kept_end_s", "chosen")}), flush=True)
-    out = os.path.join(a.out_dir, "continued.wav")
-    sf.write(out, cur, SR, subtype="PCM_24")
-    manifest["output"] = out
+    out = os.path.join(a.out_dir, "continued_48k.wav")
+    sf.write(out, cur, SR, subtype="FLOAT")
+    manifest["output_48k"] = out
+    first = manifest["passes"][0]["candidates"] if manifest["passes"] else []
+    if first:
+        chosen = [c for c in first if c["path"] == manifest["passes"][0]["chosen"]][0]
+        manifest["native_master"] = write_native_master(
+            a.input, cur, chosen["fade_s"][0], os.path.join(a.out_dir, "continued_native.wav"))
     json.dump(manifest, open(os.path.join(a.out_dir, "manifest.json"), "w"), indent=1)
     print(json.dumps({"output": out, "duration_s": len(cur) / SR}))
 

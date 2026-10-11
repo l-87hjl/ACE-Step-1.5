@@ -42,3 +42,32 @@ def release_cached_memory(mlx_cache_gb: float = None) -> None:
         mx.clear_cache()
     except (ImportError, AttributeError, RuntimeError):
         pass
+
+
+def write_native_master(src_path: str, full_48k: np.ndarray, switch_s: float,
+                        out_path: str) -> dict:
+    """Write the result at the source's own sample rate, bit-identical to the source decode.
+
+    Samples before ``switch_s`` (the start of the first crossfade) are copied verbatim
+    from ``src_path``; everything after is the 48 kHz result resampled to the source
+    rate. Both sides of the switch carry the same original audio, so the switch is
+    inaudible; the residual at the switch is reported.
+
+    Returns:
+        Dict with the path, sample rate, switch sample and switch residual in dB.
+    """
+    src, sr = sf.read(src_path, always_2d=True, dtype="float32")
+    src = src[:, :2] if src.shape[1] >= 2 else np.repeat(src, 2, axis=1)
+    if sr == SR:
+        body = full_48k
+    else:
+        g = gcd(sr, SR)
+        body = resample_poly(full_48k, sr // g, SR // g, axis=0).astype(np.float32)
+    n = min(int(switch_s * sr), len(src))
+    out = np.concatenate([src[:n], body[n:]], axis=0)
+    w = slice(max(0, n - int(0.05 * sr)), n)
+    resid = float(np.sqrt(np.mean(np.square(body[w] - src[w]))) + 1e-12)
+    sf.write(out_path, out, sr, subtype="FLOAT")
+    return {"path": out_path, "sample_rate": sr, "bit_identical_samples": n,
+            "bit_identical_until_s": round(n / sr, 6),
+            "switch_residual_db": round(20 * np.log10(resid), 1)}
