@@ -63,12 +63,22 @@ pass receives the full lyric sheet.
 
 None of these numbers replace listening.
 
-## Base model
+## Base model and the other modes
 
 `acestep-v15-base` runs on this machine with `dcw_enabled=False, shift=1.0`, 50 steps:
 about 3 min per 60 s repaint-extension job. The key was kept (D major) and the output
 was not noisy by a spectral-flatness check. Base is not required for continuation;
-repaint is available on turbo/sft/base.
+repaint is available on turbo/sft/base. On the 30 s synthetic input, base `complete`,
+`lego` (strings), `extract` (bass) and `cover` (with `duration=60` requested) **all
+returned 30.0 s**. None of them extends time.
+
+## Metadata inference (audio codes + 5 Hz LM 1.7B)
+
+`convert_src_audio_to_codes` + `understand_music` (150 codes for 30 s, 8-25 s per
+clip) recovered key and BPM for the synthetic clip (D major, 97). On the vocal clip it
+got the key right (G major) but the BPM wrong (91 vs ~115). Its caption and lyrics were
+hallucinated (Dutch "acoustic comedy", male vocal). Use provided metadata and DSP
+estimates; the 4B LM is reported to be stronger but was not tested.
 
 ## Memory on a 24 GB Mac
 
